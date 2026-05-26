@@ -16,6 +16,11 @@ type ChapterBlock =
   | { type: "text"; text: string }
   | { type: "image"; src: string };
 
+type ImageData = {
+  data: Uint8Array;
+  type: "jpg" | "png" | "gif" | "bmp";
+};
+
 function decodeHtmlEntities(text: string) {
   return text
     .replace(/&nbsp;/g, " ")
@@ -79,23 +84,16 @@ function getImageSrc(tag: string) {
 
 function parseHtmlBlocks(html: string): ChapterBlock[] {
   const blocks: ChapterBlock[] = [];
-
-  const body =
-    html.match(/<body[^>]*>([\s\S]*?)<\/body>/i)?.[1] || html;
+  const body = html.match(/<body[^>]*>([\s\S]*?)<\/body>/i)?.[1] || html;
 
   const regex =
-    /<(h1|h2|h3|p|div|img|image)[^>]*>[\s\S]*?<\/\1>|<(img|image)[^>]*\/?>/gi;
+    /<(h1|h2|h3|p|div|section|article|img|image|svg)[^>]*>[\s\S]*?<\/\1>|<(img|image)[^>]*\/?>/gi;
 
   const matches = body.match(regex) || [];
 
   for (const item of matches) {
-    if (/^<(img|image)/i.test(item)) {
-      const src = getImageSrc(item);
-      if (src) blocks.push({ type: "image", src });
-      continue;
-    }
-
     const imgTags = item.match(/<(img|image)[^>]*\/?>/gi);
+
     if (imgTags) {
       for (const imgTag of imgTags) {
         const src = getImageSrc(imgTag);
@@ -104,6 +102,7 @@ function parseHtmlBlocks(html: string): ChapterBlock[] {
     }
 
     const text = cleanText(item);
+
     if (text && !/^https?:\/\/img\.wattpad\.com/i.test(text)) {
       blocks.push({ type: "text", text });
     }
@@ -115,8 +114,9 @@ function parseHtmlBlocks(html: string): ChapterBlock[] {
 function resolveZipPath(currentHtmlFile: string, src: string) {
   if (src.startsWith("http://") || src.startsWith("https://")) return src;
 
+  const cleanSrc = src.split("#")[0].split("?")[0];
   const currentDir = currentHtmlFile.split("/").slice(0, -1).join("/");
-  const combined = currentDir ? `${currentDir}/${src}` : src;
+  const combined = currentDir ? `${currentDir}/${cleanSrc}` : cleanSrc;
 
   const parts: string[] = [];
 
@@ -129,12 +129,27 @@ function resolveZipPath(currentHtmlFile: string, src: string) {
   return parts.join("/");
 }
 
-async function getImageData(zip: JSZip, currentHtmlFile: string, src: string) {
+function imageTypeFromName(name: string): ImageData["type"] {
+  const lower = name.toLowerCase();
+
+  if (lower.endsWith(".png")) return "png";
+  if (lower.endsWith(".gif")) return "gif";
+  if (lower.endsWith(".bmp")) return "bmp";
+
+  return "jpg";
+}
+
+async function getImageData(
+  zip: JSZip,
+  currentHtmlFile: string,
+  src: string
+): Promise<ImageData | null> {
   try {
     const resolved = resolveZipPath(currentHtmlFile, src);
 
     if (resolved.startsWith("http://") || resolved.startsWith("https://")) {
       const response = await fetch(resolved);
+
       if (!response.ok) return null;
 
       const contentType = response.headers.get("content-type") || "";
@@ -144,23 +159,60 @@ async function getImageData(zip: JSZip, currentHtmlFile: string, src: string) {
 
       return {
         data: new Uint8Array(buffer),
-        type: contentType.includes("png") ? "png" : "jpg",
-      } as const;
+        type: contentType.includes("png")
+          ? "png"
+          : contentType.includes("gif")
+          ? "gif"
+          : contentType.includes("bmp")
+          ? "bmp"
+          : "jpg",
+      };
     }
 
     const file = zip.file(resolved);
     if (!file) return null;
 
-    const buffer = await file.async("uint8array");
-    const lower = resolved.toLowerCase();
-
     return {
-      data: buffer,
-      type: lower.endsWith(".png") ? "png" : "jpg",
-    } as const;
+      data: await file.async("uint8array"),
+      type: imageTypeFromName(resolved),
+    };
   } catch {
     return null;
   }
+}
+
+function findCoverImagePath(zip: JSZip) {
+  const files = Object.keys(zip.files);
+
+  const likelyCover = files.find((name) => {
+    const lower = name.toLowerCase();
+    return (
+      lower.includes("cover") &&
+      lower.match(/\.(jpg|jpeg|png|gif|bmp)$/i)
+    );
+  });
+
+  if (likelyCover) return likelyCover;
+
+  const anyImage = files.find((name) =>
+    name.match(/\.(jpg|jpeg|png|gif|bmp)$/i)
+  );
+
+  return anyImage || null;
+}
+
+async function getCoverImage(zip: JSZip): Promise<ImageData | null> {
+  const coverPath = findCoverImagePath(zip);
+
+  if (!coverPath) return null;
+
+  const file = zip.file(coverPath);
+  if (!file) return null;
+
+  return {
+    data: await file.async("uint8array"),
+    type: imageTypeFromName(coverPath),
+  };
 }
 
 export async function convertEpubToDocx(
@@ -168,6 +220,7 @@ export async function convertEpubToDocx(
   fileName: string
 ) {
   const zip = await JSZip.loadAsync(arrayBuffer);
+  const coverImage = await getCoverImage(zip);
 
   const htmlFiles = Object.keys(zip.files)
     .filter((name) => name.match(/\.(xhtml|html|htm)$/i))
@@ -203,14 +256,39 @@ export async function convertEpubToDocx(
 
   const children: Paragraph[] = [];
 
-  children.push(
-    new Paragraph({
-      text: fileName.replace(/\.epub$/i, ""),
-      heading: HeadingLevel.TITLE,
-      alignment: AlignmentType.CENTER,
-      spacing: { after: 400 },
-    })
-  );
+  if (coverImage) {
+    children.push(
+      new Paragraph({
+        alignment: AlignmentType.CENTER,
+        spacing: { after: 300 },
+        children: [
+          new ImageRun({
+            data: coverImage.data,
+            type: coverImage.type,
+            transformation: {
+              width: 430,
+              height: 620,
+            },
+          }),
+        ],
+      })
+    );
+
+    children.push(
+      new Paragraph({
+        children: [new PageBreak()],
+      })
+    );
+  } else {
+    children.push(
+      new Paragraph({
+        text: fileName.replace(/\.epub$/i, ""),
+        heading: HeadingLevel.TITLE,
+        alignment: AlignmentType.CENTER,
+        spacing: { after: 400 },
+      })
+    );
+  }
 
   children.push(
     new Paragraph({
@@ -299,11 +377,11 @@ export async function convertEpubToDocx(
             children: [
               new ImageRun({
                 data: image.data,
+                type: image.type,
                 transformation: {
                   width: 420,
                   height: 260,
                 },
-                type: image.type,
               }),
             ],
           })
