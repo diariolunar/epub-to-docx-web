@@ -144,7 +144,12 @@ function imageTypeFromName(name: string): ImageData["type"] {
 
 async function getImageSize(data: Uint8Array) {
   try {
-    const blob = new Blob([data]);
+    const arrayBuffer = data.buffer.slice(
+      data.byteOffset,
+      data.byteOffset + data.byteLength
+    ) as ArrayBuffer;
+
+    const blob = new Blob([arrayBuffer]);
     const bitmap = await createImageBitmap(blob);
 
     return {
