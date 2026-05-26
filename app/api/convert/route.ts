@@ -31,22 +31,26 @@ export async function POST(request: NextRequest) {
 
     const outputName = file.name.replace(/\.epub$/i, ".docx");
 
-    return new NextResponse(
-      new Uint8Array(docxBuffer),
-      {
-        status: 200,
-        headers: {
-          "Content-Type":
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-          "Content-Disposition": `attachment; filename="${outputName}"`,
-        },
-      }
-    );
+    return new NextResponse(new Uint8Array(docxBuffer), {
+      status: 200,
+      headers: {
+        "Content-Type":
+          "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "Content-Disposition": `attachment; filename="${outputName}"`,
+      },
+    });
   } catch (error) {
-    console.error(error);
+    console.error("Erro detalhado na conversão:", error);
+
+    const message =
+      error instanceof Error
+        ? error.message
+        : "Erro desconhecido durante a conversão.";
 
     return NextResponse.json(
-      { error: "Erro ao converter o arquivo." },
+      {
+        error: `Falha ao converter: ${message}`,
+      },
       { status: 500 }
     );
   }
