@@ -3,39 +3,89 @@
 import { useState } from "react";
 import JSZip from "jszip";
 
+const MAX_FILES = 30;
+const MAX_FILE_SIZE_MB = 25;
+const MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024;
+
+type FileStatus = "waiting" | "converting" | "done" | "error";
+
 type FileItem = {
   file: File;
-  status: "waiting" | "converting" | "done" | "error";
+  status: FileStatus;
   progress: number;
   downloadUrl?: string;
   docxBlob?: Blob;
+  errorMessage?: string;
 };
+
+function formatBytes(bytes: number) {
+  const mb = bytes / 1024 / 1024;
+  return `${mb.toFixed(2)} MB`;
+}
+
+function statusLabel(status: FileStatus) {
+  if (status === "waiting") return "Aguardando";
+  if (status === "converting") return "Convertendo";
+  if (status === "done") return "Concluído";
+  return "Erro";
+}
 
 export default function Home() {
   const [files, setFiles] = useState<FileItem[]>([]);
   const [isConverting, setIsConverting] = useState(false);
+  const [generalMessage, setGeneralMessage] = useState("");
 
   function handleFiles(selected: FileList | null) {
     if (!selected) return;
 
-    const chosen = Array.from(selected).slice(0, 30);
-
-    setFiles(
-      chosen.map((file) => ({
-        file,
-        status: "waiting",
-        progress: 0,
-      }))
+    const allFiles = Array.from(selected);
+    const epubFiles = allFiles.filter((file) =>
+      file.name.toLowerCase().endsWith(".epub")
     );
+
+    const limitedFiles = epubFiles.slice(0, MAX_FILES);
+
+    const mappedFiles: FileItem[] = limitedFiles.map((file) => {
+      const isTooLarge = file.size > MAX_FILE_SIZE_BYTES;
+
+      return {
+        file,
+        status: isTooLarge ? "error" : "waiting",
+        progress: 0,
+        errorMessage: isTooLarge
+          ? `Arquivo maior que ${MAX_FILE_SIZE_MB} MB. Tamanho: ${formatBytes(
+              file.size
+            )}.`
+          : undefined,
+      };
+    });
+
+    let message = "";
+
+    if (allFiles.length !== epubFiles.length) {
+      message += "Alguns arquivos foram ignorados porque não eram EPUB. ";
+    }
+
+    if (epubFiles.length > MAX_FILES) {
+      message += `Foram selecionados ${epubFiles.length} EPUBs, mas o limite é ${MAX_FILES}. `;
+    }
+
+    setGeneralMessage(message.trim());
+    setFiles(mappedFiles);
   }
 
   async function convertAll() {
     setIsConverting(true);
+    setGeneralMessage("");
+
     const updated = [...files];
 
     for (let i = 0; i < updated.length; i++) {
+      if (updated[i].status === "error") continue;
+
       updated[i].status = "converting";
       updated[i].progress = 15;
+      updated[i].errorMessage = undefined;
       setFiles([...updated]);
 
       try {
@@ -50,10 +100,21 @@ export default function Home() {
           body: formData,
         });
 
-        if (!response.ok) throw new Error("Erro na conversão");
-
-        updated[i].progress = 80;
+        updated[i].progress = 75;
         setFiles([...updated]);
+
+        if (!response.ok) {
+          let message = "Não foi possível converter este arquivo.";
+
+          try {
+            const data = await response.json();
+            if (data?.error) message = data.error;
+          } catch {
+            // mantém mensagem padrão
+          }
+
+          throw new Error(message);
+        }
 
         const blob = await response.blob();
         const url = URL.createObjectURL(blob);
@@ -62,11 +123,14 @@ export default function Home() {
         updated[i].downloadUrl = url;
         updated[i].status = "done";
         updated[i].progress = 100;
-
         setFiles([...updated]);
-      } catch {
+      } catch (error) {
         updated[i].status = "error";
         updated[i].progress = 0;
+        updated[i].errorMessage =
+          error instanceof Error
+            ? error.message
+            : "Erro inesperado durante a conversão.";
         setFiles([...updated]);
       }
     }
@@ -95,101 +159,171 @@ export default function Home() {
     URL.revokeObjectURL(url);
   }
 
+  function clearList() {
+    files.forEach((item) => {
+      if (item.downloadUrl) URL.revokeObjectURL(item.downloadUrl);
+    });
+
+    setFiles([]);
+    setGeneralMessage("");
+    setIsConverting(false);
+  }
+
   const doneCount = files.filter((item) => item.status === "done").length;
+  const errorCount = files.filter((item) => item.status === "error").length;
+  const waitingCount = files.filter((item) => item.status === "waiting").length;
   const canDownloadZip = doneCount > 0;
 
   return (
-    <main
-      style={{
-        maxWidth: 900,
-        margin: "40px auto",
-        padding: 20,
-        fontFamily: "Arial",
-      }}
-    >
-      <h1>EPUB → DOCX</h1>
+    <main className="min-h-screen bg-gradient-to-br from-slate-950 via-purple-950 to-slate-900 px-4 py-8 text-white">
+      <div className="mx-auto max-w-5xl">
+        <section className="mb-8 rounded-3xl border border-white/10 bg-white/10 p-8 shadow-2xl backdrop-blur">
+          <div className="mb-6">
+            <p className="mb-2 text-sm font-semibold uppercase tracking-[0.25em] text-purple-200">
+              Conversor pessoal
+            </p>
 
-      <p>Selecione até 30 arquivos EPUB.</p>
+            <h1 className="text-4xl font-bold md:text-5xl">
+              EPUB para DOCX
+            </h1>
 
-      <input
-        type="file"
-        accept=".epub"
-        multiple
-        onChange={(e) => handleFiles(e.target.files)}
-      />
-
-      <div style={{ marginTop: 20, display: "flex", gap: 10 }}>
-        <button
-          onClick={convertAll}
-          disabled={files.length === 0 || isConverting}
-        >
-          {isConverting ? "Convertendo..." : "Converter Todos"}
-        </button>
-
-        <button
-          onClick={downloadAllZip}
-          disabled={!canDownloadZip || isConverting}
-        >
-          Baixar Todos (.zip)
-        </button>
-      </div>
-
-      <p style={{ marginTop: 15 }}>
-        Concluídos: {doneCount}/{files.length}
-      </p>
-
-      <div style={{ marginTop: 30 }}>
-        {files.map((item, index) => (
-          <div
-            key={index}
-            style={{
-              border: "1px solid #ccc",
-              borderRadius: 10,
-              padding: 15,
-              marginBottom: 15,
-            }}
-          >
-            <strong>{item.file.name}</strong>
-
-            <div
-              style={{
-                width: "100%",
-                height: 12,
-                background: "#eee",
-                borderRadius: 999,
-                overflow: "hidden",
-                marginTop: 10,
-              }}
-            >
-              <div
-                style={{
-                  width: `${item.progress}%`,
-                  height: "100%",
-                  background:
-                    item.status === "done"
-                      ? "green"
-                      : item.status === "error"
-                      ? "red"
-                      : "#0070f3",
-                  transition: "0.3s",
-                }}
-              />
-            </div>
-
-            <div style={{ marginTop: 10 }}>
-              Status: {item.status}
-            </div>
-
-            {item.downloadUrl && (
-              <a
-                href={item.downloadUrl}
-                download={item.file.name.replace(/\.epub$/i, ".docx")}
-              >
-                <button style={{ marginTop: 10 }}>Baixar</button>
-              </a>
-            )}
+            <p className="mt-4 max-w-2xl text-slate-200">
+              Envie até {MAX_FILES} arquivos EPUB, converta um por vez, baixe
+              individualmente ou gere um ZIP com todos os DOCX.
+            </p>
           </div>
-        ))}
+
+          <label className="flex cursor-pointer flex-col items-center justify-center rounded-2xl border-2 border-dashed border-purple-300/50 bg-black/20 px-6 py-10 text-center transition hover:border-purple-200 hover:bg-white/10">
+            <span className="text-lg font-semibold">
+              Clique para selecionar seus EPUBs
+            </span>
+            <span className="mt-2 text-sm text-slate-300">
+              Limite: {MAX_FILES} arquivos • Máximo: {MAX_FILE_SIZE_MB} MB por
+              arquivo
+            </span>
+
+            <input
+              className="hidden"
+              type="file"
+              accept=".epub"
+              multiple
+              onChange={(e) => handleFiles(e.target.files)}
+            />
+          </label>
+
+          {generalMessage && (
+            <div className="mt-4 rounded-xl border border-yellow-300/30 bg-yellow-500/10 p-4 text-sm text-yellow-100">
+              {generalMessage}
+            </div>
+          )}
+
+          <div className="mt-6 grid gap-3 md:grid-cols-4">
+            <div className="rounded-2xl bg-white/10 p-4">
+              <p className="text-sm text-slate-300">Arquivos</p>
+              <p className="text-2xl font-bold">{files.length}</p>
+            </div>
+
+            <div className="rounded-2xl bg-white/10 p-4">
+              <p className="text-sm text-slate-300">Aguardando</p>
+              <p className="text-2xl font-bold">{waitingCount}</p>
+            </div>
+
+            <div className="rounded-2xl bg-white/10 p-4">
+              <p className="text-sm text-slate-300">Concluídos</p>
+              <p className="text-2xl font-bold">{doneCount}</p>
+            </div>
+
+            <div className="rounded-2xl bg-white/10 p-4">
+              <p className="text-sm text-slate-300">Erros</p>
+              <p className="text-2xl font-bold">{errorCount}</p>
+            </div>
+          </div>
+
+          <div className="mt-6 flex flex-wrap gap-3">
+            <button
+              onClick={convertAll}
+              disabled={files.length === 0 || isConverting}
+              className="rounded-xl bg-purple-500 px-5 py-3 font-semibold text-white shadow-lg shadow-purple-950/40 transition hover:bg-purple-400 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {isConverting ? "Convertendo..." : "Converter todos"}
+            </button>
+
+            <button
+              onClick={downloadAllZip}
+              disabled={!canDownloadZip || isConverting}
+              className="rounded-xl bg-emerald-500 px-5 py-3 font-semibold text-white shadow-lg shadow-emerald-950/40 transition hover:bg-emerald-400 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              Baixar todos (.zip)
+            </button>
+
+            <button
+              onClick={clearList}
+              disabled={files.length === 0 || isConverting}
+              className="rounded-xl bg-white/10 px-5 py-3 font-semibold text-white transition hover:bg-white/20 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              Limpar lista
+            </button>
+          </div>
+        </section>
+
+        <section className="space-y-4">
+          {files.length === 0 && (
+            <div className="rounded-3xl border border-white/10 bg-white/10 p-8 text-center text-slate-300">
+              Nenhum arquivo selecionado ainda.
+            </div>
+          )}
+
+          {files.map((item, index) => (
+            <div
+              key={`${item.file.name}-${index}`}
+              className="rounded-3xl border border-white/10 bg-white/10 p-5 shadow-xl backdrop-blur"
+            >
+              <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+                <div>
+                  <h2 className="break-all text-lg font-bold">
+                    {item.file.name}
+                  </h2>
+
+                  <p className="mt-1 text-sm text-slate-300">
+                    {formatBytes(item.file.size)} • {statusLabel(item.status)}
+                  </p>
+                </div>
+
+                <div className="flex gap-2">
+                  {item.downloadUrl && (
+                    <a
+                      href={item.downloadUrl}
+                      download={item.file.name.replace(/\.epub$/i, ".docx")}
+                      className="rounded-xl bg-emerald-500 px-4 py-2 text-sm font-semibold text-white transition hover:bg-emerald-400"
+                    >
+                      Baixar
+                    </a>
+                  )}
+                </div>
+              </div>
+
+              <div className="mt-4 h-3 overflow-hidden rounded-full bg-black/30">
+                <div
+                  className={[
+                    "h-full rounded-full transition-all duration-300",
+                    item.status === "done"
+                      ? "bg-emerald-400"
+                      : item.status === "error"
+                      ? "bg-red-400"
+                      : "bg-purple-400",
+                  ].join(" ")}
+                  style={{ width: `${item.progress}%` }}
+                />
+              </div>
+
+              {item.errorMessage && (
+                <div className="mt-4 rounded-xl border border-red-300/30 bg-red-500/10 p-3 text-sm text-red-100">
+                  {item.errorMessage}
+                </div>
+              )}
+            </div>
+          ))}
+        </section>
       </div>
     </main>
   );

@@ -266,8 +266,8 @@ export async function convertEpubToDocx(
             data: coverImage.data,
             type: coverImage.type,
             transformation: {
-              width: 430,
-              height: 620,
+              width: 595,
+              height: 842,
             },
           }),
         ],

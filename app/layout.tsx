@@ -1,3 +1,5 @@
+import "./globals.css";
+
 export const metadata = {
   title: "EPUB para DOCX",
   description: "Conversor pessoal de EPUB para DOCX",
