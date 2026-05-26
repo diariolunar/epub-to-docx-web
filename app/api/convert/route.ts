@@ -23,18 +23,25 @@ export async function POST(request: NextRequest) {
     }
 
     const arrayBuffer = await file.arrayBuffer();
-    const docxBuffer = await convertEpubToDocx(arrayBuffer, file.name);
+
+    const docxBuffer = await convertEpubToDocx(
+      arrayBuffer,
+      file.name
+    );
 
     const outputName = file.name.replace(/\.epub$/i, ".docx");
 
-    return new NextResponse(docxBuffer, {
-      status: 200,
-      headers: {
-        "Content-Type":
-          "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        "Content-Disposition": `attachment; filename="${outputName}"`,
-      },
-    });
+    return new NextResponse(
+      new Uint8Array(docxBuffer),
+      {
+        status: 200,
+        headers: {
+          "Content-Type":
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+          "Content-Disposition": `attachment; filename="${outputName}"`,
+        },
+      }
+    );
   } catch (error) {
     console.error(error);
 
