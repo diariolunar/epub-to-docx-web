@@ -7,6 +7,8 @@ import {
   HeadingLevel,
   AlignmentType,
   PageBreak,
+  Bookmark,
+  InternalHyperlink,
 } from "docx";
 
 function decodeHtmlEntities(text: string) {
@@ -51,6 +53,10 @@ function getCleanFileName(path: string) {
   return path.split("/").pop()?.replace(/\.(xhtml|html|htm)$/i, "") || path;
 }
 
+function makeBookmarkId(index: number) {
+  return `chapter_${index + 1}`;
+}
+
 export async function convertEpubToDocx(
   arrayBuffer: ArrayBuffer,
   fileName: string
@@ -66,9 +72,11 @@ export async function convertEpubToDocx(
   const chapterData: {
     title: string;
     lines: string[];
+    bookmarkId: string;
   }[] = [];
 
-  for (const htmlFile of htmlFiles) {
+  for (let i = 0; i < htmlFiles.length; i++) {
+    const htmlFile = htmlFiles[i];
     const rawHtml = await zip.files[htmlFile].async("text");
     const text = stripHtml(rawHtml);
 
@@ -86,6 +94,7 @@ export async function convertEpubToDocx(
     chapterData.push({
       title,
       lines,
+      bookmarkId: makeBookmarkId(chapterData.length),
     });
   }
 
@@ -112,7 +121,17 @@ export async function convertEpubToDocx(
   for (const chapter of chapterData) {
     children.push(
       new Paragraph({
-        text: chapter.title,
+        children: [
+          new InternalHyperlink({
+            anchor: chapter.bookmarkId,
+            children: [
+              new TextRun({
+                text: chapter.title,
+                style: "Hyperlink",
+              }),
+            ],
+          }),
+        ],
         spacing: { after: 120 },
       })
     );
@@ -127,7 +146,18 @@ export async function convertEpubToDocx(
 
     children.push(
       new Paragraph({
-        text: chapter.title,
+        children: [
+          new Bookmark({
+            id: chapter.bookmarkId,
+            children: [
+              new TextRun({
+                text: chapter.title,
+                bold: true,
+                size: 32,
+              }),
+            ],
+          }),
+        ],
         heading: HeadingLevel.HEADING_1,
         alignment: AlignmentType.CENTER,
         spacing: { after: 300 },
@@ -147,9 +177,7 @@ export async function convertEpubToDocx(
               size: 24,
             }),
           ],
-          spacing: {
-            after: 120,
-          },
+          spacing: { after: 120 },
         })
       );
     }
