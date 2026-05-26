@@ -19,6 +19,8 @@ type ChapterBlock =
 type ImageData = {
   data: Uint8Array;
   type: "jpg" | "png" | "gif" | "bmp";
+  width: number;
+  height: number;
 };
 
 function decodeHtmlEntities(text: string) {
@@ -47,9 +49,7 @@ function getTitleFromHtml(html: string, fallback: string) {
   const h2 = html.match(/<h2[^>]*>(.*?)<\/h2>/i);
   const title = h1?.[1] || h2?.[1];
 
-  if (!title) return fallback;
-
-  return cleanText(title) || fallback;
+  return title ? cleanText(title) || fallback : fallback;
 }
 
 function getCleanFileName(path: string) {
@@ -103,9 +103,12 @@ function parseHtmlBlocks(html: string): ChapterBlock[] {
 
     const text = cleanText(item);
 
-    if (text && !/^https?:\/\/img\.wattpad\.com/i.test(text)) {
-      blocks.push({ type: "text", text });
+    if (text && /^https?:\/\/img\.wattpad\.com/i.test(text)) {
+      blocks.push({ type: "image", src: text });
+      continue;
     }
+
+    if (text) blocks.push({ type: "text", text });
   }
 
   return blocks;
@@ -139,6 +142,37 @@ function imageTypeFromName(name: string): ImageData["type"] {
   return "jpg";
 }
 
+async function getImageSize(data: Uint8Array) {
+  try {
+    const blob = new Blob([data]);
+    const bitmap = await createImageBitmap(blob);
+
+    return {
+      width: bitmap.width,
+      height: bitmap.height,
+    };
+  } catch {
+    return {
+      width: 800,
+      height: 600,
+    };
+  }
+}
+
+function fitImageSize(
+  originalWidth: number,
+  originalHeight: number,
+  maxWidth: number,
+  maxHeight: number
+) {
+  const ratio = Math.min(maxWidth / originalWidth, maxHeight / originalHeight);
+
+  return {
+    width: Math.round(originalWidth * ratio),
+    height: Math.round(originalHeight * ratio),
+  };
+}
+
 async function getImageData(
   zip: JSZip,
   currentHtmlFile: string,
@@ -156,9 +190,13 @@ async function getImageData(
       if (!contentType.startsWith("image/")) return null;
 
       const buffer = await response.arrayBuffer();
+      const data = new Uint8Array(buffer);
+      const size = await getImageSize(data);
 
       return {
-        data: new Uint8Array(buffer),
+        data,
+        width: size.width,
+        height: size.height,
         type: contentType.includes("png")
           ? "png"
           : contentType.includes("gif")
@@ -172,8 +210,13 @@ async function getImageData(
     const file = zip.file(resolved);
     if (!file) return null;
 
+    const data = await file.async("uint8array");
+    const size = await getImageSize(data);
+
     return {
-      data: await file.async("uint8array"),
+      data,
+      width: size.width,
+      height: size.height,
       type: imageTypeFromName(resolved),
     };
   } catch {
@@ -186,19 +229,17 @@ function findCoverImagePath(zip: JSZip) {
 
   const likelyCover = files.find((name) => {
     const lower = name.toLowerCase();
+
     return (
-      lower.includes("cover") &&
-      lower.match(/\.(jpg|jpeg|png|gif|bmp)$/i)
+      lower.includes("cover") && lower.match(/\.(jpg|jpeg|png|gif|bmp)$/i)
     );
   });
 
   if (likelyCover) return likelyCover;
 
-  const anyImage = files.find((name) =>
-    name.match(/\.(jpg|jpeg|png|gif|bmp)$/i)
+  return (
+    files.find((name) => name.match(/\.(jpg|jpeg|png|gif|bmp)$/i)) || null
   );
-
-  return anyImage || null;
 }
 
 async function getCoverImage(zip: JSZip): Promise<ImageData | null> {
@@ -209,8 +250,13 @@ async function getCoverImage(zip: JSZip): Promise<ImageData | null> {
   const file = zip.file(coverPath);
   if (!file) return null;
 
+  const data = await file.async("uint8array");
+  const size = await getImageSize(data);
+
   return {
-    data: await file.async("uint8array"),
+    data,
+    width: size.width,
+    height: size.height,
     type: imageTypeFromName(coverPath),
   };
 }
@@ -238,8 +284,6 @@ export async function convertEpubToDocx(
     const rawHtml = await zip.files[htmlFile].async("text");
     const blocks = parseHtmlBlocks(rawHtml);
 
-    if (blocks.length === 0) continue;
-
     const textBlocks = blocks.filter((block) => block.type === "text");
     if (textBlocks.length === 0) continue;
 
@@ -252,6 +296,10 @@ export async function convertEpubToDocx(
       htmlFile,
       bookmarkId: makeBookmarkId(chapterData.length),
     });
+  }
+
+  if (chapterData.length === 0) {
+    throw new Error("Nenhum capítulo de texto foi encontrado neste EPUB.");
   }
 
   const children: Paragraph[] = [];
@@ -292,7 +340,7 @@ export async function convertEpubToDocx(
 
   children.push(
     new Paragraph({
-      text: "Table of Contents",
+      text: "Sumário",
       heading: HeadingLevel.HEADING_1,
       alignment: AlignmentType.CENTER,
       spacing: { before: 400, after: 300 },
@@ -350,7 +398,6 @@ export async function convertEpubToDocx(
         const cleanLine = block.text.replace(/^#+\s*/, "").trim();
 
         if (!cleanLine || cleanLine === chapter.title) continue;
-        if (/^https?:\/\/img\.wattpad\.com/i.test(cleanLine)) continue;
 
         children.push(
           new Paragraph({
@@ -367,8 +414,9 @@ export async function convertEpubToDocx(
 
       if (block.type === "image") {
         const image = await getImageData(zip, chapter.htmlFile, block.src);
-
         if (!image) continue;
+
+        const size = fitImageSize(image.width, image.height, 420, 520);
 
         children.push(
           new Paragraph({
@@ -378,10 +426,7 @@ export async function convertEpubToDocx(
               new ImageRun({
                 data: image.data,
                 type: image.type,
-                transformation: {
-                  width: 420,
-                  height: 260,
-                },
+                transformation: size,
               }),
             ],
           })
