@@ -21,6 +21,7 @@ describe("convertEpubToDocx", () => {
     const xml = await docx.file("word/document.xml")!.async("text");
 
     expect(xml.indexOf("Primeiro")).toBeLessThan(xml.indexOf("Segundo"));
+    expect(xml.match(/>Primeiro</g)).toHaveLength(2); // sumário + título do capítulo
     expect(xml).toContain("Uma ");
     expect(xml).toContain("frase");
     expect(xml).toContain("espaços");

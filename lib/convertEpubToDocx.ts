@@ -235,6 +235,10 @@ function titleFromDocument(html: string, fallback: string) {
   return getText(heading || document).replace(/\s+/g, " ").trim() || fallback;
 }
 
+function normalizedBlockText(block: TextBlock) {
+  return block.runs.map((run) => run.text || "").join("").replace(/\s+/g, " ").trim().toLocaleLowerCase();
+}
+
 function findCoverImagePath(zip: JSZip) {
   return Object.keys(zip.files).find((name) => /cover/i.test(name) && /\.(jpg|jpeg|png|gif|bmp)$/i.test(name)) || null;
 }
@@ -276,7 +280,14 @@ export async function convertEpubToDocx(arrayBuffer: ArrayBuffer, fileName: stri
   for (const chapter of chapterData) {
     children.push(new Paragraph({ children: [new PageBreak()] }));
     children.push(new Paragraph({ heading: HeadingLevel.HEADING_1, alignment: AlignmentType.CENTER, children: [new Bookmark({ id: chapter.bookmarkId, children: [new TextRun({ text: chapter.title, bold: true, size: 32 })] })] }));
+    let skippedSourceTitle = false;
     for (const block of chapter.blocks) {
+      // The DOCX title above replaces the first equivalent h1/h2 from the EPUB.
+      // Keeping both produces a duplicated heading at the beginning of every chapter.
+      if (!skippedSourceTitle && block.type === "text" && block.heading && normalizedBlockText(block) === chapter.title.replace(/\s+/g, " ").trim().toLocaleLowerCase()) {
+        skippedSourceTitle = true;
+        continue;
+      }
       if (block.pageBreakBefore) children.push(new Paragraph({ children: [new PageBreak()] }));
       if (block.type === "image") {
         const image = await getImageData(zip, chapter.htmlFile, block.src);
