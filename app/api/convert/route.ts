@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { convertEpubToDocx } from "@/lib/convertEpubToDocx";
 
 export const runtime = "nodejs";
+const MAX_FILE_SIZE_BYTES = 25 * 1024 * 1024;
 
 export async function POST(request: NextRequest) {
   try {
@@ -22,6 +23,13 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    if (file.size > MAX_FILE_SIZE_BYTES) {
+      return NextResponse.json(
+        { error: "O arquivo excede o limite de 25 MB." },
+        { status: 413 }
+      );
+    }
+
     const arrayBuffer = await file.arrayBuffer();
 
     const docxBuffer = await convertEpubToDocx(
@@ -36,7 +44,7 @@ export async function POST(request: NextRequest) {
       headers: {
         "Content-Type":
           "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        "Content-Disposition": `attachment; filename="${outputName}"`,
+        "Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(outputName)}`,
       },
     });
   } catch (error) {

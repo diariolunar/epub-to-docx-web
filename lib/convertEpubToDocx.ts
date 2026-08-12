@@ -1,20 +1,31 @@
 import JSZip from "jszip";
+import { parseDocument } from "htmlparser2";
 import {
+  AlignmentType,
+  Bookmark,
   Document,
+  HeadingLevel,
+  ImageRun,
+  InternalHyperlink,
   Packer,
+  PageBreak,
   Paragraph,
   TextRun,
-  HeadingLevel,
-  AlignmentType,
-  PageBreak,
-  Bookmark,
-  InternalHyperlink,
-  ImageRun,
 } from "docx";
 
-type ChapterBlock =
-  | { type: "text"; text: string }
-  | { type: "image"; src: string };
+type DomNode = {
+  type: string;
+  name?: string;
+  data?: string;
+  attribs?: Record<string, string>;
+  children?: DomNode[];
+};
+
+type RunStyle = { bold?: boolean; italics?: boolean; underline?: {}; superScript?: boolean; subScript?: boolean };
+type Heading = (typeof HeadingLevel)[keyof typeof HeadingLevel];
+type TextBlock = { type: "text"; runs: Array<{ text?: string; break?: number; style: RunStyle }>; heading?: Heading; bullet?: boolean; pageBreakBefore?: boolean };
+type ImageBlock = { type: "image"; src: string; pageBreakBefore?: boolean };
+type ChapterBlock = TextBlock | ImageBlock;
 
 type ImageData = {
   data: Uint8Array;
@@ -23,440 +34,258 @@ type ImageData = {
   height: number;
 };
 
-function decodeHtmlEntities(text: string) {
-  return text
-    .replace(/&nbsp;/g, " ")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, "\"")
-    .replace(/&#39;/g, "'");
+const BLOCK_TAGS = new Set(["p", "div", "section", "article", "aside", "blockquote", "li", "pre", "address", "figure", "figcaption", "dt", "dd"]);
+const PAGE_BREAK_PATTERN = /(?:page-break-(?:before|after)\s*:\s*(?:always|page)|break-(?:before|after)\s*:\s*page)/i;
+
+function childrenOf(node: DomNode) {
+  return node.children || [];
 }
 
-function cleanText(html: string) {
-  return decodeHtmlEntities(
-    html
-      .replace(/<script[\s\S]*?<\/script>/gi, "")
-      .replace(/<style[\s\S]*?<\/style>/gi, "")
-      .replace(/<[^>]+>/g, "")
-      .replace(/\s+/g, " ")
-      .trim()
-  );
+function isElement(node: DomNode) {
+  return node.type === "tag" || node.type === "script" || node.type === "style";
 }
 
-function getTitleFromHtml(html: string, fallback: string) {
-  const h1 = html.match(/<h1[^>]*>(.*?)<\/h1>/i);
-  const h2 = html.match(/<h2[^>]*>(.*?)<\/h2>/i);
-  const title = h1?.[1] || h2?.[1];
-
-  return title ? cleanText(title) || fallback : fallback;
+function getText(node: DomNode): string {
+  if (node.type === "text") return node.data || "";
+  return childrenOf(node).map(getText).join("");
 }
 
-function getCleanFileName(path: string) {
-  return path.split("/").pop()?.replace(/\.(xhtml|html|htm)$/i, "") || path;
-}
-
-function shouldIgnoreHtmlFile(name: string) {
-  const lower = name.toLowerCase();
-
-  return (
-    lower.includes("toc") ||
-    lower.includes("nav") ||
-    lower.includes("cover") ||
-    lower.includes("titlepage") ||
-    lower.includes("title-page") ||
-    lower.includes("copyright")
-  );
-}
-
-function makeBookmarkId(index: number) {
-  return `chapter_${index + 1}`;
-}
-
-function getImageSrc(tag: string) {
-  const src =
-    tag.match(/\ssrc=["']([^"']+)["']/i)?.[1] ||
-    tag.match(/\shref=["']([^"']+)["']/i)?.[1] ||
-    tag.match(/\sxlink:href=["']([^"']+)["']/i)?.[1];
-
-  return src ? decodeHtmlEntities(src.trim()) : "";
-}
-
-function parseHtmlBlocks(html: string): ChapterBlock[] {
-  const blocks: ChapterBlock[] = [];
-  const body = html.match(/<body[^>]*>([\s\S]*?)<\/body>/i)?.[1] || html;
-
-  const regex =
-    /<(h1|h2|h3|p|div|section|article|img|image|svg)[^>]*>[\s\S]*?<\/\1>|<(img|image)[^>]*\/?>/gi;
-
-  const matches = body.match(regex) || [];
-
-  for (const item of matches) {
-    const imgTags = item.match(/<(img|image)[^>]*\/?>/gi);
-
-    if (imgTags) {
-      for (const imgTag of imgTags) {
-        const src = getImageSrc(imgTag);
-        if (src) blocks.push({ type: "image", src });
-      }
-    }
-
-    const text = cleanText(item);
-
-    if (text && /^https?:\/\/img\.wattpad\.com/i.test(text)) {
-      blocks.push({ type: "image", src: text });
-      continue;
-    }
-
-    if (text) blocks.push({ type: "text", text });
-  }
-
-  return blocks;
-}
-
-function resolveZipPath(currentHtmlFile: string, src: string) {
-  if (src.startsWith("http://") || src.startsWith("https://")) return src;
-
-  const cleanSrc = src.split("#")[0].split("?")[0];
-  const currentDir = currentHtmlFile.split("/").slice(0, -1).join("/");
-  const combined = currentDir ? `${currentDir}/${cleanSrc}` : cleanSrc;
-
+function normalizePath(path: string) {
   const parts: string[] = [];
-
-  for (const part of combined.split("/")) {
+  for (const part of path.replace(/\\/g, "/").split("/")) {
     if (!part || part === ".") continue;
     if (part === "..") parts.pop();
     else parts.push(part);
   }
-
   return parts.join("/");
 }
 
+function resolveZipPath(currentFile: string, target: string) {
+  const cleanTarget = target.split("#")[0].split("?")[0];
+  if (/^https?:\/\//i.test(cleanTarget)) return cleanTarget;
+  const directory = currentFile.split("/").slice(0, -1).join("/");
+  return normalizePath(directory ? `${directory}/${cleanTarget}` : cleanTarget);
+}
+
+function cleanFileName(path: string) {
+  return path.split("/").pop()?.replace(/\.(xhtml|html|htm)$/i, "") || path;
+}
+
 function imageTypeFromName(name: string): ImageData["type"] {
-  const lower = name.toLowerCase();
-
-  if (lower.endsWith(".png")) return "png";
-  if (lower.endsWith(".gif")) return "gif";
-  if (lower.endsWith(".bmp")) return "bmp";
-
+  if (/\.png$/i.test(name)) return "png";
+  if (/\.gif$/i.test(name)) return "gif";
+  if (/\.bmp$/i.test(name)) return "bmp";
   return "jpg";
 }
 
+function fitImageSize(width: number, height: number, maxWidth: number, maxHeight: number) {
+  const ratio = Math.min(maxWidth / width, maxHeight / height, 1);
+  return { width: Math.round(width * ratio), height: Math.round(height * ratio) };
+}
+
 async function getImageSize(data: Uint8Array) {
+  // createImageBitmap is available in browsers; the server falls back to a safe size.
+  if (typeof createImageBitmap !== "function") return { width: 800, height: 600 };
   try {
-    const arrayBuffer = data.buffer.slice(
-      data.byteOffset,
-      data.byteOffset + data.byteLength
-    ) as ArrayBuffer;
-
-    const blob = new Blob([arrayBuffer]);
-    const bitmap = await createImageBitmap(blob);
-
-    return {
-      width: bitmap.width,
-      height: bitmap.height,
-    };
+    const bitmap = await createImageBitmap(new Blob([data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer]));
+    return { width: bitmap.width, height: bitmap.height };
   } catch {
-    return {
-      width: 800,
-      height: 600,
-    };
+    return { width: 800, height: 600 };
   }
 }
 
-function fitImageSize(
-  originalWidth: number,
-  originalHeight: number,
-  maxWidth: number,
-  maxHeight: number
-) {
-  const ratio = Math.min(maxWidth / originalWidth, maxHeight / originalHeight);
-
-  return {
-    width: Math.round(originalWidth * ratio),
-    height: Math.round(originalHeight * ratio),
-  };
+async function getImageData(zip: JSZip, htmlFile: string, src: string): Promise<ImageData | null> {
+  const path = resolveZipPath(htmlFile, src);
+  // Do not fetch remote URLs from an uploaded EPUB: this keeps the API free of SSRF.
+  if (/^https?:\/\//i.test(path)) return null;
+  const file = zip.file(path);
+  if (!file) return null;
+  const data = await file.async("uint8array");
+  const size = await getImageSize(data);
+  return { data, type: imageTypeFromName(path), ...size };
 }
 
-async function getImageData(
-  zip: JSZip,
-  currentHtmlFile: string,
-  src: string
-): Promise<ImageData | null> {
-  try {
-    const resolved = resolveZipPath(currentHtmlFile, src);
+function findFirst(node: DomNode, predicate: (item: DomNode) => boolean): DomNode | undefined {
+  if (predicate(node)) return node;
+  for (const child of childrenOf(node)) {
+    const found = findFirst(child, predicate);
+    if (found) return found;
+  }
+}
 
-    if (resolved.startsWith("http://") || resolved.startsWith("https://")) {
-      const response = await fetch(resolved);
+function findAll(node: DomNode, predicate: (item: DomNode) => boolean, result: DomNode[] = []) {
+  if (predicate(node)) result.push(node);
+  for (const child of childrenOf(node)) findAll(child, predicate, result);
+  return result;
+}
 
-      if (!response.ok) return null;
-
-      const contentType = response.headers.get("content-type") || "";
-      if (!contentType.startsWith("image/")) return null;
-
-      const buffer = await response.arrayBuffer();
-      const data = new Uint8Array(buffer);
-      const size = await getImageSize(data);
-
-      return {
-        data,
-        width: size.width,
-        height: size.height,
-        type: contentType.includes("png")
-          ? "png"
-          : contentType.includes("gif")
-          ? "gif"
-          : contentType.includes("bmp")
-          ? "bmp"
-          : "jpg",
-      };
+async function getSpineHtmlFiles(zip: JSZip) {
+  const container = zip.file("META-INF/container.xml");
+  if (container) {
+    const containerDom = parseDocument(await container.async("text"), { xmlMode: true, decodeEntities: true }) as unknown as DomNode;
+    const rootfile = findFirst(containerDom, (node) => node.name?.toLowerCase() === "rootfile");
+    const opfPath = rootfile?.attribs?.["full-path"];
+    const opf = opfPath && zip.file(opfPath);
+    if (opf && opfPath) {
+      const opfDom = parseDocument(await opf.async("text"), { xmlMode: true, decodeEntities: true }) as unknown as DomNode;
+      const manifest = new Map<string, string>();
+      for (const item of findAll(opfDom, (node) => node.name?.toLowerCase() === "item")) {
+        const id = item.attribs?.id;
+        const href = item.attribs?.href;
+        const type = item.attribs?.["media-type"];
+        if (id && href && /(?:xhtml|html)/i.test(type || href)) manifest.set(id, resolveZipPath(opfPath, href));
+      }
+      const spine = findAll(opfDom, (node) => node.name?.toLowerCase() === "itemref")
+        .map((item) => manifest.get(item.attribs?.idref || ""))
+        .filter((path): path is string => Boolean(path && zip.file(path)));
+      if (spine.length) return spine;
     }
-
-    const file = zip.file(resolved);
-    if (!file) return null;
-
-    const data = await file.async("uint8array");
-    const size = await getImageSize(data);
-
-    return {
-      data,
-      width: size.width,
-      height: size.height,
-      type: imageTypeFromName(resolved),
-    };
-  } catch {
-    return null;
   }
+  return Object.keys(zip.files).filter((name) => /\.(xhtml|html|htm)$/i.test(name)).sort();
+}
+
+function headingFor(tag: string): Heading | undefined {
+  const headings: Record<string, Heading> = {
+    h1: HeadingLevel.HEADING_1, h2: HeadingLevel.HEADING_2, h3: HeadingLevel.HEADING_3,
+    h4: HeadingLevel.HEADING_4, h5: HeadingLevel.HEADING_5, h6: HeadingLevel.HEADING_6,
+  };
+  return headings[tag];
+}
+
+function hasPageBreak(node: DomNode) {
+  const attrs = node.attribs || {};
+  return PAGE_BREAK_PATTERN.test(attrs.style || "") || /pagebreak|page-break/i.test(`${attrs.class || ""} ${attrs["epub:type"] || ""}`);
+}
+
+function inlineRuns(nodes: DomNode[], style: RunStyle = {}): TextBlock["runs"] {
+  const runs: TextBlock["runs"] = [];
+  const addText = (text: string) => {
+    const normalized = text.replace(/[\t\r\n ]+/g, " ");
+    if (normalized) runs.push({ text: normalized, style });
+  };
+  for (const node of nodes) {
+    if (node.type === "text") { addText(node.data || ""); continue; }
+    if (!isElement(node)) continue;
+    const tag = node.name?.toLowerCase() || "";
+    if (tag === "br") { runs.push({ break: 1, style }); continue; }
+    if (tag === "script" || tag === "style" || tag === "noscript") continue;
+    const nextStyle: RunStyle = {
+      ...style,
+      bold: style.bold || tag === "strong" || tag === "b",
+      italics: style.italics || tag === "em" || tag === "i",
+      underline: style.underline || (tag === "u" ? {} : undefined),
+      superScript: style.superScript || tag === "sup",
+      subScript: style.subScript || tag === "sub",
+    };
+    runs.push(...inlineRuns(childrenOf(node), nextStyle));
+  }
+  return runs;
+}
+
+function parseHtmlBlocks(html: string): ChapterBlock[] {
+  const document = parseDocument(html, { xmlMode: false, decodeEntities: true }) as unknown as DomNode;
+  const body = findFirst(document, (node) => node.name?.toLowerCase() === "body") || document;
+  const blocks: ChapterBlock[] = [];
+
+  const visit = (nodes: DomNode[]) => {
+    for (const node of nodes) {
+      if (node.type === "text" && node.data?.trim()) {
+        const runs = inlineRuns([node]);
+        if (runs.length) blocks.push({ type: "text", runs });
+        continue;
+      }
+      if (!isElement(node)) continue;
+      const tag = node.name?.toLowerCase() || "";
+      if (tag === "script" || tag === "style" || tag === "nav") continue;
+      if (tag === "img" || tag === "image") {
+        const src = node.attribs?.src || node.attribs?.href || node.attribs?.["xlink:href"];
+        if (src) blocks.push({ type: "image", src, pageBreakBefore: hasPageBreak(node) });
+        continue;
+      }
+      if (tag === "br") continue;
+      if (BLOCK_TAGS.has(tag) || headingFor(tag)) {
+        const containsNestedBlocks = childrenOf(node).some((child) => {
+          const childTag = child.name?.toLowerCase() || "";
+          return BLOCK_TAGS.has(childTag) || Boolean(headingFor(childTag));
+        });
+        // EPUBs commonly use div/section solely as wrappers around paragraphs.
+        // Keeping their children separate prevents text from adjacent paragraphs joining.
+        if (tag !== "p" && tag !== "li" && containsNestedBlocks) {
+          if (hasPageBreak(node)) blocks.push({ type: "text", runs: [], pageBreakBefore: true });
+          visit(childrenOf(node));
+          continue;
+        }
+        const runs = inlineRuns(childrenOf(node));
+        if (runs.some((run) => run.text?.trim() || run.break)) {
+          blocks.push({ type: "text", runs, heading: headingFor(tag), bullet: tag === "li", pageBreakBefore: hasPageBreak(node) });
+        }
+        continue;
+      }
+      if (hasPageBreak(node)) blocks.push({ type: "text", runs: [], pageBreakBefore: true });
+      visit(childrenOf(node));
+    }
+  };
+  visit(childrenOf(body));
+  return blocks;
+}
+
+function titleFromDocument(html: string, fallback: string) {
+  const document = parseDocument(html, { xmlMode: false, decodeEntities: true }) as unknown as DomNode;
+  const heading = findFirst(document, (node) => ["h1", "h2"].includes(node.name?.toLowerCase() || ""));
+  return getText(heading || document).replace(/\s+/g, " ").trim() || fallback;
 }
 
 function findCoverImagePath(zip: JSZip) {
-  const files = Object.keys(zip.files);
-
-  const likelyCover = files.find((name) => {
-    const lower = name.toLowerCase();
-
-    return (
-      lower.includes("cover") && lower.match(/\.(jpg|jpeg|png|gif|bmp)$/i)
-    );
-  });
-
-  if (likelyCover) return likelyCover;
-
-  return (
-    files.find((name) => name.match(/\.(jpg|jpeg|png|gif|bmp)$/i)) || null
-  );
+  return Object.keys(zip.files).find((name) => /cover/i.test(name) && /\.(jpg|jpeg|png|gif|bmp)$/i.test(name)) || null;
 }
 
-async function getCoverImage(zip: JSZip): Promise<ImageData | null> {
-  const coverPath = findCoverImagePath(zip);
-
-  if (!coverPath) return null;
-
-  const file = zip.file(coverPath);
-  if (!file) return null;
-
-  const data = await file.async("uint8array");
-  const size = await getImageSize(data);
-
-  return {
-    data,
-    width: size.width,
-    height: size.height,
-    type: imageTypeFromName(coverPath),
-  };
+async function getCoverImage(zip: JSZip) {
+  const path = findCoverImagePath(zip);
+  return path ? getImageData(zip, "", path) : null;
 }
 
-export async function convertEpubToDocx(
-  arrayBuffer: ArrayBuffer,
-  fileName: string
-) {
+export async function convertEpubToDocx(arrayBuffer: ArrayBuffer, fileName: string) {
   const zip = await JSZip.loadAsync(arrayBuffer);
-  const coverImage = await getCoverImage(zip);
-
-  const htmlFiles = Object.keys(zip.files)
-    .filter((name) => name.match(/\.(xhtml|html|htm)$/i))
-    .filter((name) => !shouldIgnoreHtmlFile(name))
-    .sort();
-
-  const chapterData: {
-    title: string;
-    blocks: ChapterBlock[];
-    htmlFile: string;
-    bookmarkId: string;
-  }[] = [];
+  const htmlFiles = await getSpineHtmlFiles(zip);
+  const chapterData: Array<{ title: string; blocks: ChapterBlock[]; htmlFile: string; bookmarkId: string }> = [];
 
   for (const htmlFile of htmlFiles) {
-    const rawHtml = await zip.files[htmlFile].async("text");
-    const blocks = parseHtmlBlocks(rawHtml);
-
-    const textBlocks = blocks.filter((block) => block.type === "text");
-    if (textBlocks.length === 0) continue;
-
-    const title = getTitleFromHtml(rawHtml, getCleanFileName(htmlFile));
-    if (title.toLowerCase() === "cover") continue;
-
-    chapterData.push({
-      title,
-      blocks,
-      htmlFile,
-      bookmarkId: makeBookmarkId(chapterData.length),
-    });
+    const file = zip.file(htmlFile);
+    if (!file) continue;
+    const html = await file.async("text");
+    const blocks = parseHtmlBlocks(html);
+    if (!blocks.some((block) => block.type === "text" && block.runs.some((run) => run.text?.trim()))) continue;
+    const title = titleFromDocument(html, cleanFileName(htmlFile));
+    chapterData.push({ title, blocks, htmlFile, bookmarkId: `chapter_${chapterData.length + 1}` });
   }
-
-  if (chapterData.length === 0) {
-    throw new Error("Nenhum capítulo de texto foi encontrado neste EPUB.");
-  }
+  if (!chapterData.length) throw new Error("Nenhum capítulo de texto foi encontrado neste EPUB.");
 
   const children: Paragraph[] = [];
-
-  if (coverImage) {
-    children.push(
-      new Paragraph({
-        alignment: AlignmentType.CENTER,
-        spacing: { after: 300 },
-        children: [
-          new ImageRun({
-            data: coverImage.data,
-            type: coverImage.type,
-            transformation: {
-              width: 595,
-              height: 842,
-            },
-          }),
-        ],
-      })
-    );
-
-    children.push(
-      new Paragraph({
-        children: [new PageBreak()],
-      })
-    );
+  const cover = await getCoverImage(zip);
+  if (cover) {
+    const size = fitImageSize(cover.width, cover.height, 595, 842);
+    children.push(new Paragraph({ alignment: AlignmentType.CENTER, children: [new ImageRun({ data: cover.data, type: cover.type, transformation: size })] }));
+    children.push(new Paragraph({ children: [new PageBreak()] }));
   } else {
-    children.push(
-      new Paragraph({
-        text: fileName.replace(/\.epub$/i, ""),
-        heading: HeadingLevel.TITLE,
-        alignment: AlignmentType.CENTER,
-        spacing: { after: 400 },
-      })
-    );
+    children.push(new Paragraph({ text: fileName.replace(/\.epub$/i, ""), heading: HeadingLevel.TITLE, alignment: AlignmentType.CENTER }));
   }
-
-  children.push(
-    new Paragraph({
-      text: "Sumário",
-      heading: HeadingLevel.HEADING_1,
-      alignment: AlignmentType.CENTER,
-      spacing: { before: 400, after: 300 },
-    })
-  );
-
+  children.push(new Paragraph({ text: "Sumário", heading: HeadingLevel.HEADING_1, alignment: AlignmentType.CENTER }));
   for (const chapter of chapterData) {
-    children.push(
-      new Paragraph({
-        children: [
-          new InternalHyperlink({
-            anchor: chapter.bookmarkId,
-            children: [
-              new TextRun({
-                text: chapter.title,
-                style: "Hyperlink",
-              }),
-            ],
-          }),
-        ],
-        spacing: { after: 120 },
-      })
-    );
+    children.push(new Paragraph({ children: [new InternalHyperlink({ anchor: chapter.bookmarkId, children: [new TextRun({ text: chapter.title, style: "Hyperlink" })] })] }));
   }
-
   for (const chapter of chapterData) {
-    children.push(
-      new Paragraph({
-        children: [new PageBreak()],
-      })
-    );
-
-    children.push(
-      new Paragraph({
-        children: [
-          new Bookmark({
-            id: chapter.bookmarkId,
-            children: [
-              new TextRun({
-                text: chapter.title,
-                bold: true,
-                size: 32,
-              }),
-            ],
-          }),
-        ],
-        heading: HeadingLevel.HEADING_1,
-        alignment: AlignmentType.CENTER,
-        spacing: { after: 300 },
-      })
-    );
-
+    children.push(new Paragraph({ children: [new PageBreak()] }));
+    children.push(new Paragraph({ heading: HeadingLevel.HEADING_1, alignment: AlignmentType.CENTER, children: [new Bookmark({ id: chapter.bookmarkId, children: [new TextRun({ text: chapter.title, bold: true, size: 32 })] })] }));
     for (const block of chapter.blocks) {
-      if (block.type === "text") {
-        const cleanLine = block.text.replace(/^#+\s*/, "").trim();
-
-        if (!cleanLine || cleanLine === chapter.title) continue;
-
-        children.push(
-          new Paragraph({
-            children: [
-              new TextRun({
-                text: cleanLine,
-                size: 24,
-              }),
-            ],
-            spacing: { after: 120 },
-          })
-        );
-      }
-
+      if (block.pageBreakBefore) children.push(new Paragraph({ children: [new PageBreak()] }));
       if (block.type === "image") {
         const image = await getImageData(zip, chapter.htmlFile, block.src);
         if (!image) continue;
-
-        const size = fitImageSize(image.width, image.height, 420, 520);
-
-        children.push(
-          new Paragraph({
-            alignment: AlignmentType.CENTER,
-            spacing: { before: 200, after: 200 },
-            children: [
-              new ImageRun({
-                data: image.data,
-                type: image.type,
-                transformation: size,
-              }),
-            ],
-          })
-        );
+        children.push(new Paragraph({ alignment: AlignmentType.CENTER, children: [new ImageRun({ data: image.data, type: image.type, transformation: fitImageSize(image.width, image.height, 420, 520) })] }));
+      } else if (block.runs.length) {
+        children.push(new Paragraph({ heading: block.heading, bullet: block.bullet ? { level: 0 } : undefined, spacing: { after: 120 }, children: block.runs.map((run) => new TextRun({ text: run.text, break: run.break, size: 24, ...run.style })) }));
       }
     }
   }
-
-  const doc = new Document({
-    sections: [
-      {
-        properties: {
-          page: {
-            margin: {
-              top: 1134,
-              right: 1134,
-              bottom: 1134,
-              left: 1134,
-            },
-          },
-        },
-        children,
-      },
-    ],
-  });
-
-  return await Packer.toBuffer(doc);
+  return Packer.toBuffer(new Document({ sections: [{ properties: { page: { margin: { top: 1134, right: 1134, bottom: 1134, left: 1134 } } }, children }] }));
 }
