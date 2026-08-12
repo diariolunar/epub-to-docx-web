@@ -192,7 +192,11 @@ export default function Home() {
               type="file"
               accept=".epub"
               multiple
-              onChange={(e) => handleFiles(e.target.files)}
+              onChange={(e) => {
+                handleFiles(e.target.files);
+                // Allow selecting the same EPUB again after clearing or retrying.
+                e.currentTarget.value = "";
+              }}
             />
           </label>
 
